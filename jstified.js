@@ -1,6 +1,8 @@
-var FRAMEDIV = 60,
-    CPUSPEED = 6E6,
-    STOPPERIOD = CPUSPEED / FRAMEDIV;
+// emu.stop_period = cycles per LCD update
+// emu.full_speed = no LCD updates until idle (??)
+// z8.speed = cycles per second
+var FRAMEDIV = 60; // LCD frames per second
+
 CTyE = {
     CTyQ: 0,
     CTyR: 1,
@@ -493,7 +495,6 @@ function FlashROM() {
         this.pnum = this.pages.length;
     };
 }
-var flash = new FlashROM;
 
 function flash_write(c, d) {
     c &= flash.mask;
@@ -675,8 +676,6 @@ function LCD(screenElement) {
     };
 }
 
-var lcd = {};
-
 function rom_type_and_subtype(c) {
     var d = -1;
     var f = -1;
@@ -690,17 +689,9 @@ function rom_type_and_subtype(c) {
     return [d, f];
 }
 
-function process_rom(c) {
-    var [type, subtype] = rom_type_and_subtype(c);
-    console.assert(type != -1);
-    i6 = new i6_struct(type, subtype);
-    i6.loadrom(c);
-}
-
 var tss = 0,
     running = false,
-    lastRun = -1,
-    autorun = true;
+    lastRun = -1;
 
 function evt_handlers_init() {
     for (const elem of document.querySelectorAll(".calckey")) {
@@ -721,21 +712,44 @@ function timeout(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+var flash;
+var lcd;
+var emu;
+var z8;
+var i6;
+
 async function jsTIfied(config) {
+    // config.canvasElement: a 192x128 canvas element for the LCD display
     // config.rom: either a Blob (from an input form element), or a string URL
     // config.files: a list of Blobs and/or strings
     // config.pressKeys: a list of key codes
-    // config.canvasElement: a 192x128 canvas element for the LCD display
-    lcd = new LCD(config.canvasElement);
+    // config.turboFactor: a scaling factor (1.0 is authentic speed, 2.0 is faster)
+
+    config.files = config.files || [];
+    config.pressKeys = config.pressKeys || [];
+    config.turboFactor = config.turboFactor || 1.0;
+    let fullSpeed = (config.turboFactor > 10);
+    config.turboFactor = fullSpeed ? Infinity : config.turboFactor;
+
     evt_handlers_init();
-    z8_init_tables();
+
     var rom_blob = config.rom;
     if (typeof(config.rom) === "string") {
         let rom_response = await fetch(config.rom);
         rom_blob = await rom_response.blob();
     }
     let rom_string = arrayBufferToString(await rom_blob.arrayBuffer());
-    process_rom(rom_string);
+
+    var [type, subtype] = rom_type_and_subtype(rom_string);
+    console.assert(type != -1);
+
+    flash = new FlashROM;
+    lcd = new LCD(config.canvasElement);
+    emu = new EmuCore();
+    z8 = new z8_struct(fullSpeed ? 1.0 : config.turboFactor);
+    i6 = new i6_struct(type, subtype);
+    i6.loadrom(rom_string);
+    emu.full_speed = fullSpeed;
 
     if (i6.type == CTyE.CTyP) {
         ti_common_doreset = i5_reset;
@@ -750,7 +764,8 @@ async function jsTIfied(config) {
     }
     i6_mem_chmode();
     ti_common_doreset();
-    ti83p_init();
+    flash.mem = i6.rom;
+    lcd.paintScreen();
     start();
     await timeout(500);
     await press_key(128);
@@ -808,26 +823,18 @@ function run(c) {
     }
 }
 
-var KEYHI_ERASE_DELAY = 100;
-
 function EmuCore() {
-    this.stop_period = this.stop_cnt = 0;
-    this.full_speed = !1;
+    this.stop_period = 0;
+    this.stop_cnt = 0;
+    this.full_speed = false;
     this.it_num = 1;
     this.it_cnt = [];
     this.ct_num = 0;
     this.ct_cnt = [];
     this.ct_ids = [];
     this.dbus = 0;
-    this.partner_link = this.link_state = 3;
-}
-var emu = new EmuCore;
-
-i6 = {};
-
-function ti83p_init() {
-    flash.mem = i6.rom;
-    lcd.paintScreen();
+    this.partner_link = 3;
+    this.link_state = 3;
 }
 
 async function press_key(keyCode) {
@@ -942,23 +949,23 @@ function lcd_update() {
     }
 }
 
-function calculator_run_timed(c) {
-    var d = emu.stop_period;
-    if (emu.stop_cnt + c >= d) {
-        c -= d - emu.stop_cnt;
+function calculator_run_timed(cycles) {
+    var cycles_per_frame = emu.stop_period;
+    if (emu.stop_cnt + cycles >= cycles_per_frame) {
+        cycles -= cycles_per_frame - emu.stop_cnt;
         i6_run();
         lcd_update();
-        emu.stop_cnt -= d;
-        while (emu.stop_cnt + c >= d) {
+        emu.stop_cnt -= cycles_per_frame;
+        while (emu.stop_cnt + cycles >= cycles_per_frame) {
             i6_run();
             lcd_update();
-            emu.stop_cnt -= d;
-            c -= d;
+            emu.stop_cnt -= cycles_per_frame;
+            cycles -= cycles_per_frame;
         }
     }
-    emu.stop_period = emu.stop_cnt + c;
+    emu.stop_period = emu.stop_cnt + cycles;
     i6_run();
-    emu.stop_period = d
+    emu.stop_period = cycles_per_frame;
 };
 
 function i6_reset() {
@@ -971,7 +978,7 @@ function i6_reset() {
         lcd.cblk = 6553.5;
         i6.subtype == CTyE.CTySCSE ? flash.reset(i6.subtype, i6.rom) : flash.reset(i6.type, i6.rom);
         emu.stop_cnt = 0;
-        emu.stop_period = STOPPERIOD;
+        emu.stop_period = z8.speed / FRAMEDIV;
         emu.dbus = 254;
         emu.link_state = 3;
         i6.page[0] = -1;
@@ -1162,11 +1169,10 @@ function i6_out(c, d) {
         case 32:
             var e = z8.speed;
             i6.portbuf[PSEnumX.PORT20] = d;
-            z8.speed = d & 3 ? 15E6 : 6E6;
-            CPUSPEED = z8.speed;
+            z8.speed = (d & 3 ? 15 : 6) * z8.one_mhz_scaling_factor;
             if (e != z8.speed) {
                 for (f = 0; f < emu.ct_cnt.length; f++) emu.ct_cnt[f] *= z8.speed / e;
-                emu.stop_period = STOPPERIOD = z8.speed / FRAMEDIV
+                emu.stop_period = z8.speed / FRAMEDIV;
             }
             case 33:
                 if (i6.flash_lock & 1) {
@@ -1568,7 +1574,7 @@ function i5_reset() {
         lcd.cblk = 65535;
         flash.reset(i6.type, i6.rom);
         emu.stop_cnt = 0;
-        emu.stop_period = STOPPERIOD;
+        emu.stop_period = z8.speed / FRAMEDIV;
         emu.dbus = 254;
         emu.link_state = 3;
         i6.portbuf[PSEnum3.PORT0] = 176;
@@ -1622,7 +1628,7 @@ function i5_out(c, d) {
             break;
         case 4:
             i6.portbuf[PSEnum3.PORT4] = d;
-            i6.it_times[3] = CPUSPEED * (3 + ((d & 6) << 1)) / 1620;
+            i6.it_times[3] = z8.speed * (3 + ((d & 6) << 1)) / 1620;
             i6.it_times[0] = i6.it_times[3] >> 1;
             i6.it_times[1] = i6.it_times[0] +
                 1600;
@@ -1863,20 +1869,18 @@ var Regs_A = 0,
     Regs2_SP = 0,
     Regs2_PC = 1;
 
-function z8_struct() {
+function z8_struct(turboFactor) {
+    this.one_mhz_scaling_factor = Math.floor(turboFactor * 1E6);
     this.r = new Uint8Array(REGS_8BIT);
     this.r2 = new Uint16Array(REGS_16BIT);
     this.im = this.iff2 = this.iff1 = 0;
     this.halted = !1;
-    this.speed = 6E6;
+    this.speed = 6 * this.one_mhz_scaling_factor;
     this.breaks = 0;
     this.breakp = [];
     this.breakim = !1;
     this.watches = {};
-}
-var z8 = new z8_struct;
 
-function z8_init_tables() {
     var c, d, f, e;
     for (c = 0; 256 > c; c++) {
         zTe5[c] = c & 168;
@@ -1901,9 +1905,7 @@ function z8_reset() {
     z8.im = 1;
     z8.halted = 0;
     z8.ie = 0;
-    CPUSPEED = 6E6;
-    z8.speed = CPUSPEED;
-    STOPPERIOD = CPUSPEED / FRAMEDIV;
+    z8.speed = 6 * z8.one_mhz_scaling_factor;
 }
 
 function z8_interrupt_force() {
